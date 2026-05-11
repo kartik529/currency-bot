@@ -8,16 +8,17 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN        = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TWELVE_API_KEY   = os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_DATA_API_KEY_HERE")
 BASE_CURRENCY    = "AUD"
-WATCH_CURRENCIES = ["EUR", "GBP", "AUD", "JPY", "INR"]  # default currencies
+WATCH_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "INR"]  # default currencies
 ALERT_THRESHOLD  = 0.5   # % change to trigger fluctuation alert
 CHECK_INTERVAL   = 60    # seconds between checks
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
-previous_rates:   dict = {}   # { "USD": {"EUR": 0.91, ...}, "EUR": {"GBP": 0.85, ...} }
+previous_rates:   dict = {}
 subscribed_users: set  = set()
 
-# Per-user custom single currency watch lists (vs USD)
+# Per-user custom single currency watch lists (vs AUD)
 # { chat_id: {"CAD", "CHF", ...} }
 user_currencies: dict = {}
 
@@ -25,8 +26,8 @@ user_currencies: dict = {}
 # { chat_id: {("EUR", "GBP"), ("INR", "AED"), ...} }
 user_pairs: dict = {}
 
-# Price breach alerts for single currencies (vs USD)
-# { chat_id: [{"currency": "EUR", "target": 0.95, "direction": "above"}, ...] }
+# Price breach alerts for single currencies (vs AUD)
+# { chat_id: [{"currency": "USD", "target": 0.65, "direction": "above"}, ...] }
 price_alerts: dict = {}
 
 # Price breach alerts for currency PAIRS
@@ -34,34 +35,69 @@ price_alerts: dict = {}
 pair_alerts: dict = {}
 
 
-# ── FETCH HELPERS ─────────────────────────────────────────────────────────────
+# ── TWELVE DATA FETCH HELPERS ─────────────────────────────────────────────────
+def fetch_single_rate(from_cur: str, to_cur: str) -> float:
+    """
+    Fetch real-time rate for a single pair from Twelve Data.
+    Returns the exchange rate as a float.
+    """
+    symbol = f"{from_cur}/{to_cur}"
+    url = (
+        f"https://api.twelvedata.com/exchange_rate"
+        f"?symbol={symbol}&apikey={TWELVE_API_KEY}"
+    )
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") == "error":
+        raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown error')}")
+
+    return float(data["rate"])
+
+
 def fetch_rates_for_base(base: str, targets: list) -> dict:
-    """Fetch rates: base → each target. Returns {target: rate}."""
-    symbols = ",".join(t for t in targets if t != base)
-    if not symbols:
+    """
+    Fetch real-time rates for multiple targets vs a base currency.
+    Returns {target: rate} dict.
+    Batches into a single API call using comma-separated symbols.
+    """
+    targets = [t for t in targets if t != base]
+    if not targets:
         return {}
-    url = f"https://api.frankfurter.app/latest?from={base}&to={symbols}"
+
+    symbols = ",".join(f"{base}/{t}" for t in targets)
+    url = (
+        f"https://api.twelvedata.com/exchange_rate"
+        f"?symbol={symbols}&apikey={TWELVE_API_KEY}"
+    )
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
-    return resp.json()["rates"]
+    data = resp.json()
+
+    rates = {}
+
+    # Single pair returns a dict directly; multiple pairs returns {symbol: dict}
+    if "rate" in data:
+        # Single pair response
+        pair_symbol = list(data.get("symbol", f"{base}/{targets[0]}").split("/"))
+        if len(pair_symbol) == 2:
+            rates[pair_symbol[1]] = float(data["rate"])
+    else:
+        # Multiple pairs response
+        for symbol, info in data.items():
+            if isinstance(info, dict) and "rate" in info:
+                to_cur = symbol.split("/")[1]
+                rates[to_cur] = float(info["rate"])
+
+    return rates
 
 
-def get_pair_rate(from_cur: str, to_cur: str) -> float:
-    """Get the live rate for any from_cur → to_cur pair."""
-    if from_cur == to_cur:
-        return 1.0
-    url = f"https://api.frankfurter.app/latest?from={from_cur}&to={to_cur}"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    return resp.json()["rates"][to_cur]
-
-
-def validate_currency(currency: str) -> bool:
-    """Check if a currency code is valid via Frankfurter API."""
+def validate_currency(from_cur: str, to_cur: str = "USD") -> bool:
+    """Validate a currency by trying to fetch its rate from Twelve Data."""
     try:
-        url = f"https://api.frankfurter.app/latest?from=USD&to={currency}"
-        resp = requests.get(url, timeout=10)
-        return resp.status_code == 200
+        rate = fetch_single_rate(from_cur, to_cur)
+        return rate > 0
     except Exception:
         return False
 
@@ -72,28 +108,18 @@ def get_user_currencies(chat_id) -> list:
     return list(set(WATCH_CURRENCIES) | custom)
 
 
-def pair_key(from_cur: str, to_cur: str) -> str:
-    return f"{from_cur}/{to_cur}"
-
-
 # ── BACKGROUND CHECK ──────────────────────────────────────────────────────────
 async def check_and_alert(app):
     global previous_rates
 
-    # ── Gather all bases needed ───────────────────────────────────────────
-    # Single currency bases (always USD + any user pair bases)
-    all_bases: dict = {}   # { base: set(targets) }
-
-    # USD vs default + user currencies
+    # ── Gather all currencies needed ──────────────────────────────────────
     usd_targets = set(WATCH_CURRENCIES)
     for chat_id in subscribed_users:
         usd_targets |= user_currencies.get(chat_id, set())
     for chat_id in price_alerts:
         for a in price_alerts[chat_id]:
             usd_targets.add(a["currency"])
-    all_bases[BASE_CURRENCY] = usd_targets
 
-    # Pair bases
     all_pair_set = set()
     for chat_id in user_pairs:
         all_pair_set |= user_pairs[chat_id]
@@ -101,22 +127,24 @@ async def check_and_alert(app):
         for a in pair_alerts[chat_id]:
             all_pair_set.add((a["from"], a["to"]))
 
-    for (fc, tc) in all_pair_set:
-        if fc not in all_bases:
-            all_bases[fc] = set()
-        all_bases[fc].add(tc)
+    current_rates: dict = {}
 
-    # ── Fetch all rates ───────────────────────────────────────────────────
-    current_rates: dict = {}   # { base: {target: rate} }
-    for base, targets in all_bases.items():
-        targets_list = [t for t in targets if t != base]
-        if not targets_list:
-            continue
+    # Fetch base currency rates
+    try:
+        base_rates = fetch_rates_for_base(BASE_CURRENCY, list(usd_targets))
+        current_rates[BASE_CURRENCY] = base_rates
+    except Exception as e:
+        print(f"Error fetching base rates: {e}")
+
+    # Fetch pair rates one by one (to avoid overloading free tier)
+    for (fc, tc) in all_pair_set:
         try:
-            rates = fetch_rates_for_base(base, targets_list)
-            current_rates[base] = rates
+            rate = fetch_single_rate(fc, tc)
+            if fc not in current_rates:
+                current_rates[fc] = {}
+            current_rates[fc][tc] = rate
         except Exception as e:
-            print(f"Error fetching rates for {base}: {e}")
+            print(f"Error fetching {fc}/{tc}: {e}")
 
     if not current_rates:
         return
@@ -124,30 +152,32 @@ async def check_and_alert(app):
     # First run — store and return
     if not previous_rates:
         previous_rates = current_rates
-        print("Initial rates loaded:", current_rates)
+        print("✅ Initial real-time rates loaded:", current_rates)
         return
 
-    # ── 1. Single currency fluctuation alerts (vs USD) ────────────────────
-    usd_current  = current_rates.get(BASE_CURRENCY, {})
-    usd_previous = previous_rates.get(BASE_CURRENCY, {})
+    base_current  = current_rates.get(BASE_CURRENCY, {})
+    base_previous = previous_rates.get(BASE_CURRENCY, {})
 
+    # ── 1. Single currency fluctuation alerts ─────────────────────────────
     for uid in subscribed_users.copy():
         messages = []
+
+        # vs AUD
         for currency in get_user_currencies(uid):
-            rate = usd_current.get(currency)
-            old  = usd_previous.get(currency)
+            rate = base_current.get(currency)
+            old  = base_previous.get(currency)
             if rate is None or old is None:
                 continue
             change_pct = ((rate - old) / old) * 100
             if abs(change_pct) >= ALERT_THRESHOLD:
                 arrow = "📈" if change_pct > 0 else "📉"
-                dire  = "UP" if change_pct > 0 else "DOWN"
+                dire  = "UP"  if change_pct > 0 else "DOWN"
                 messages.append(
                     f"{arrow} *{BASE_CURRENCY}/{currency}* went *{dire}*\n"
                     f"   {old:.4f} → {rate:.4f}  ({change_pct:+.2f}%)"
                 )
 
-        # Pair fluctuation alerts
+        # Pair fluctuations
         for (fc, tc) in user_pairs.get(uid, set()):
             rate = current_rates.get(fc, {}).get(tc)
             old  = previous_rates.get(fc, {}).get(tc)
@@ -156,7 +186,7 @@ async def check_and_alert(app):
             change_pct = ((rate - old) / old) * 100
             if abs(change_pct) >= ALERT_THRESHOLD:
                 arrow = "📈" if change_pct > 0 else "📉"
-                dire  = "UP" if change_pct > 0 else "DOWN"
+                dire  = "UP"  if change_pct > 0 else "DOWN"
                 messages.append(
                     f"{arrow} *{fc}/{tc}* went *{dire}*\n"
                     f"   {old:.4f} → {rate:.4f}  ({change_pct:+.2f}%)"
@@ -178,7 +208,7 @@ async def check_and_alert(app):
         remaining = []
         for alert in alerts:
             cur  = alert["currency"]
-            rate = usd_current.get(cur)
+            rate = base_current.get(cur)
             if rate is None:
                 remaining.append(alert)
                 continue
@@ -193,7 +223,7 @@ async def check_and_alert(app):
         price_alerts[chat_id] = remaining
         await _send_breach_alerts(app, chat_id, triggered)
 
-    # ── 3. Currency PAIR price breach alerts ──────────────────────────────
+    # ── 3. Currency pair price breach alerts ──────────────────────────────
     for chat_id, alerts in list(pair_alerts.items()):
         triggered = []
         remaining = []
@@ -219,7 +249,7 @@ async def check_and_alert(app):
 
 
 async def _send_breach_alerts(app, chat_id, triggered: list):
-    """Send breach alert messages for triggered alerts."""
+    """Send breach alert messages."""
     for pair_label, rate, target, direction in triggered:
         symbol = "📈" if direction == "above" else "📉"
         try:
@@ -243,26 +273,29 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subscribed_users.add(chat_id)
     await update.message.reply_text(
         "✅ *Subscribed to Currency Bot!*\n\n"
-        f"📌 *Default watch (vs USD):* {', '.join(WATCH_CURRENCIES)}\n"
-        f"⚡ Fluctuation alerts trigger at >{ALERT_THRESHOLD}% change\n\n"
+        f"📌 *Base currency:* {BASE_CURRENCY} (Australian Dollar)\n"
+        f"📌 *Default watch:* {', '.join(WATCH_CURRENCIES)}\n"
+        f"⚡ *Data:* Real-time via Twelve Data\n"
+        f"🔄 *Check interval:* Every {CHECK_INTERVAL} seconds\n"
+        f"🔔 *Fluctuation alert:* >{ALERT_THRESHOLD}% change\n\n"
         "📋 *All Commands:*\n\n"
-        "━━ *Single Currency (vs USD)* ━━\n"
-        "/rates               – Live rates vs USD\n"
-        "/addcurrency XYZ     – Track a currency vs USD\n"
-        "/removecurrency XYZ  – Stop tracking it\n"
-        "/mycurrencies        – Your currency list\n\n"
+        "━━ *Single Currency (vs AUD)* ━━\n"
+        "/rates                   – Live rates vs AUD\n"
+        "/addcurrency XYZ         – Track a currency vs AUD\n"
+        "/removecurrency XYZ      – Stop tracking it\n"
+        "/mycurrencies            – Your currency list\n\n"
         "━━ *Currency Pairs* ━━\n"
-        "/pairrate EUR GBP    – Live rate for any pair\n"
-        "/addpair EUR GBP     – Track EUR/GBP fluctuations\n"
-        "/removepair EUR GBP  – Stop tracking a pair\n"
-        "/mypairs             – Your tracked pairs\n\n"
+        "/pairrate EUR GBP        – Live rate for any pair\n"
+        "/addpair EUR GBP         – Track EUR/GBP fluctuations\n"
+        "/removepair EUR GBP      – Stop tracking a pair\n"
+        "/mypairs                 – Your tracked pairs\n\n"
         "━━ *Price Alerts* ━━\n"
-        "/setalert EUR 0.95 above      – Alert when USD/EUR > 0.95\n"
+        "/setalert USD 0.65 above         – Alert when AUD/USD > 0.65\n"
         "/setpairalert EUR GBP 0.85 above – Alert when EUR/GBP > 0.85\n"
-        "/myalerts            – All your active alerts\n"
-        "/cancelalert 1       – Cancel alert by number\n\n"
+        "/myalerts                – All your active alerts\n"
+        "/cancelalert 1           – Cancel alert number 1\n\n"
         "━━ *Other* ━━\n"
-        "/stop                – Unsubscribe from alerts",
+        "/stop                    – Unsubscribe from alerts",
         parse_mode="Markdown"
     )
 
@@ -277,20 +310,23 @@ async def stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── SINGLE CURRENCY COMMANDS ──────────────────────────────────────────────────
 
 async def rates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show live rates for user's currency list vs USD."""
+    """Show live rates for user's currency list vs AUD."""
     chat_id = update.effective_chat.id
+    user_curr_list = get_user_currencies(chat_id)
+    await update.message.reply_text("🔄 Fetching real-time rates...")
     try:
-        current = fetch_rates_for_base(BASE_CURRENCY, get_user_currencies(chat_id))
+        current = fetch_rates_for_base(BASE_CURRENCY, user_curr_list)
         lines = [
             f"*{BASE_CURRENCY}/{cur}:* `{rate:.4f}`"
             for cur, rate in sorted(current.items())
         ]
         await update.message.reply_text(
-            "💱 *Your Rates vs USD*\n\n" + "\n".join(lines),
+            "💱 *Live Rates vs AUD*\n"
+            "_(Real-time via Twelve Data)_\n\n" + "\n".join(lines),
             parse_mode="Markdown"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ Error fetching rates: {e}")
 
 
 async def addcurrency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -298,24 +334,39 @@ async def addcurrency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
         currency = ctx.args[0].upper()
+
+        if currency == BASE_CURRENCY:
+            await update.message.reply_text(
+                f"❌ *{currency}* is already your base currency!",
+                parse_mode="Markdown"
+            )
+            return
+
         if currency in get_user_currencies(chat_id):
             await update.message.reply_text(
                 f"ℹ️ *{BASE_CURRENCY}/{currency}* is already in your watch list!",
                 parse_mode="Markdown"
             )
             return
-        await update.message.reply_text(f"🔍 Validating *{currency}*...", parse_mode="Markdown")
-        if not validate_currency(currency):
+
+        await update.message.reply_text(
+            f"🔍 Validating *{currency}*...", parse_mode="Markdown"
+        )
+
+        try:
+            rate = fetch_single_rate(BASE_CURRENCY, currency)
+        except Exception:
             await update.message.reply_text(
                 f"❌ *{currency}* is not a valid currency code.\n"
                 "Use 3-letter ISO codes: `CAD`, `CHF`, `CNY`, `SGD`, `AED`",
                 parse_mode="Markdown"
             )
             return
+
         if chat_id not in user_currencies:
             user_currencies[chat_id] = set()
         user_currencies[chat_id].add(currency)
-        rate = fetch_rates_for_base(BASE_CURRENCY, [currency]).get(currency)
+
         await update.message.reply_text(
             f"✅ *{BASE_CURRENCY}/{currency}* added!\n\n"
             f"💱 Current rate: `{rate:.4f}`\n\n"
@@ -359,7 +410,6 @@ async def removecurrency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def mycurrencies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show user's currency watch list."""
     chat_id = update.effective_chat.id
     custom  = user_currencies.get(chat_id, set())
     default_line = "📌 *Default:* " + ", ".join(f"`{c}`" for c in sorted(WATCH_CURRENCIES))
@@ -369,7 +419,7 @@ async def mycurrencies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "➕ *Added:* None — use `/addcurrency XYZ`"
     )
     await update.message.reply_text(
-        "💱 *Your Currency Watch List (vs USD)*\n\n" +
+        f"💱 *Your Currency Watch List (vs {BASE_CURRENCY})*\n\n" +
         default_line + "\n" + custom_line,
         parse_mode="Markdown"
     )
@@ -378,30 +428,25 @@ async def mycurrencies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── CURRENCY PAIR COMMANDS ────────────────────────────────────────────────────
 
 async def pairrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Get live rate for any currency pair.
-    Usage: /pairrate EUR GBP
-           /pairrate INR AED
-    """
+    """Usage: /pairrate EUR GBP"""
     try:
         from_cur = ctx.args[0].upper()
         to_cur   = ctx.args[1].upper()
         await update.message.reply_text(
-            f"🔍 Fetching *{from_cur}/{to_cur}* rate...", parse_mode="Markdown"
+            f"🔄 Fetching real-time *{from_cur}/{to_cur}* rate...",
+            parse_mode="Markdown"
         )
-        rate = get_pair_rate(from_cur, to_cur)
+        rate = fetch_single_rate(from_cur, to_cur)
         await update.message.reply_text(
-            f"💱 *{from_cur}/{to_cur}*\n\n"
+            f"💱 *{from_cur}/{to_cur}* _(Real-time)_\n\n"
             f"1 {from_cur} = `{rate:.4f}` {to_cur}\n\n"
-            f"To track this pair: `/addpair {from_cur} {to_cur}`\n"
-            f"To set an alert:    `/setpairalert {from_cur} {to_cur} {rate:.4f} above`",
+            f"Track this pair : `/addpair {from_cur} {to_cur}`\n"
+            f"Set an alert    : `/setpairalert {from_cur} {to_cur} {rate:.4f} above`",
             parse_mode="Markdown"
         )
-    except (IndexError, KeyError):
+    except IndexError:
         await update.message.reply_text(
-            "❌ Usage: `/pairrate EUR GBP`\n"
-            "Provide two valid 3-letter currency codes.",
-            parse_mode="Markdown"
+            "❌ Usage: `/pairrate EUR GBP`", parse_mode="Markdown"
         )
     except Exception as e:
         await update.message.reply_text(
@@ -410,11 +455,7 @@ async def pairrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def addpair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Track fluctuations for a currency pair.
-    Usage: /addpair EUR GBP
-           /addpair INR AED
-    """
+    """Usage: /addpair EUR GBP"""
     chat_id = update.effective_chat.id
     try:
         from_cur = ctx.args[0].upper()
@@ -433,16 +474,15 @@ async def addpair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            f"🔍 Validating *{from_cur}/{to_cur}*...", parse_mode="Markdown"
+            f"🔄 Validating *{from_cur}/{to_cur}*...", parse_mode="Markdown"
         )
 
-        # Validate by fetching rate
         try:
-            rate = get_pair_rate(from_cur, to_cur)
+            rate = fetch_single_rate(from_cur, to_cur)
         except Exception:
             await update.message.reply_text(
                 f"❌ Could not fetch *{from_cur}/{to_cur}*.\n"
-                "Please check both currency codes are valid 3-letter ISO codes.",
+                "Check both currency codes are valid 3-letter ISO codes.",
                 parse_mode="Markdown"
             )
             return
@@ -454,7 +494,7 @@ async def addpair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ *{from_cur}/{to_cur}* pair added!\n\n"
             f"💱 Current rate: 1 {from_cur} = `{rate:.4f}` {to_cur}\n\n"
-            f"You'll get alerts when it moves >{ALERT_THRESHOLD}%.\n"
+            f"You'll get alerts when it moves >{ALERT_THRESHOLD}%.\n\n"
             f"Set a price target:\n"
             f"`/setpairalert {from_cur} {to_cur} {rate:.4f} above`\n"
             f"`/setpairalert {from_cur} {to_cur} {rate:.4f} below`",
@@ -462,23 +502,17 @@ async def addpair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except IndexError:
         await update.message.reply_text(
-            "❌ Usage: `/addpair EUR GBP`\n"
-            "Provide two valid 3-letter currency codes.",
-            parse_mode="Markdown"
+            "❌ Usage: `/addpair EUR GBP`", parse_mode="Markdown"
         )
 
 
 async def removepair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Stop tracking a currency pair.
-    Usage: /removepair EUR GBP
-    """
+    """Usage: /removepair EUR GBP"""
     chat_id = update.effective_chat.id
     try:
         from_cur = ctx.args[0].upper()
         to_cur   = ctx.args[1].upper()
         pair     = (from_cur, to_cur)
-
         if chat_id in user_pairs and pair in user_pairs[chat_id]:
             user_pairs[chat_id].discard(pair)
             await update.message.reply_text(
@@ -498,10 +532,8 @@ async def removepair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def mypairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show all tracked currency pairs."""
     chat_id = update.effective_chat.id
     pairs   = user_pairs.get(chat_id, set())
-
     if not pairs:
         await update.message.reply_text(
             "You have no tracked pairs.\n\n"
@@ -509,7 +541,6 @@ async def mypairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-
     lines = [f"• *{fc}/{tc}*" for fc, tc in sorted(pairs)]
     await update.message.reply_text(
         "🔁 *Your Tracked Pairs:*\n\n" + "\n".join(lines) + "\n\n"
@@ -523,9 +554,9 @@ async def mypairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def setalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Set price alert for a single currency vs USD.
-    Usage: /setalert EUR 0.95 above
-           /setalert CAD 1.35 below
+    Set price alert for a single currency vs AUD.
+    Usage: /setalert USD 0.65 above
+           /setalert EUR 0.55 below
     """
     chat_id = update.effective_chat.id
     try:
@@ -541,7 +572,9 @@ async def setalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"🔍 Validating *{currency}*...", parse_mode="Markdown"
             )
-            if not validate_currency(currency):
+            try:
+                fetch_single_rate(BASE_CURRENCY, currency)
+            except Exception:
                 await update.message.reply_text(
                     f"❌ *{currency}* is not a valid currency code.",
                     parse_mode="Markdown"
@@ -557,21 +590,21 @@ async def setalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "currency": currency, "target": target, "direction": direction
         })
 
-        rate = fetch_rates_for_base(BASE_CURRENCY, [currency]).get(currency)
+        rate   = fetch_single_rate(BASE_CURRENCY, currency)
         symbol = "📈" if direction == "above" else "📉"
         await update.message.reply_text(
             f"{symbol} *Alert Set!*\n\n"
-            f"Pair      : *{BASE_CURRENCY}/{currency}*\n"
-            f"Trigger   : rate goes *{direction}* `{target}`\n"
-            f"Current   : `{rate:.4f}`\n\n"
+            f"Pair    : *{BASE_CURRENCY}/{currency}*\n"
+            f"Trigger : rate goes *{direction}* `{target}`\n"
+            f"Current : `{rate:.4f}`\n\n"
             "🚨 You'll be notified the moment it hits your target!",
             parse_mode="Markdown"
         )
     except (IndexError, ValueError):
         await update.message.reply_text(
             "❌ Usage:\n"
-            "`/setalert EUR 0.95 above`\n"
-            "`/setalert CAD 1.35 below`",
+            "`/setalert USD 0.65 above`\n"
+            "`/setalert EUR 0.55 below`",
             parse_mode="Markdown"
         )
 
@@ -596,9 +629,8 @@ async def setpairalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Both currencies cannot be the same!")
             return
 
-        # Validate pair by fetching rate
         try:
-            rate = get_pair_rate(from_cur, to_cur)
+            rate = fetch_single_rate(from_cur, to_cur)
         except Exception:
             await update.message.reply_text(
                 f"❌ Could not validate *{from_cur}/{to_cur}*.\n"
@@ -607,7 +639,7 @@ async def setpairalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Auto-add pair to tracking list
+        # Auto-add pair to tracking
         if chat_id not in user_pairs:
             user_pairs[chat_id] = set()
         user_pairs[chat_id].add((from_cur, to_cur))
@@ -622,9 +654,9 @@ async def setpairalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         symbol = "📈" if direction == "above" else "📉"
         await update.message.reply_text(
             f"{symbol} *Pair Alert Set!*\n\n"
-            f"Pair      : *{from_cur}/{to_cur}*\n"
-            f"Trigger   : rate goes *{direction}* `{target}`\n"
-            f"Current   : 1 {from_cur} = `{rate:.4f}` {to_cur}\n\n"
+            f"Pair    : *{from_cur}/{to_cur}*\n"
+            f"Trigger : rate goes *{direction}* `{target}`\n"
+            f"Current : 1 {from_cur} = `{rate:.4f}` {to_cur}\n\n"
             "🚨 You'll be notified the moment it hits your target!",
             parse_mode="Markdown"
         )
@@ -638,7 +670,6 @@ async def setpairalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def myalerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show all active alerts (single + pair)."""
     chat_id = update.effective_chat.id
     single  = price_alerts.get(chat_id, [])
     pairs   = pair_alerts.get(chat_id, [])
@@ -646,8 +677,8 @@ async def myalerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not single and not pairs:
         await update.message.reply_text(
             "You have no active alerts.\n\n"
-            "Single currency: `/setalert EUR 0.95 above`\n"
-            "Currency pair  : `/setpairalert EUR GBP 0.85 above`",
+            "Single currency : `/setalert USD 0.65 above`\n"
+            "Currency pair   : `/setpairalert EUR GBP 0.85 above`",
             parse_mode="Markdown"
         )
         return
@@ -658,7 +689,7 @@ async def myalerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         symbol = "📈" if a["direction"] == "above" else "📉"
         lines.append(
             f"{i}. {symbol} *{BASE_CURRENCY}/{a['currency']}* "
-            f"{a['direction']} `{a['target']}` _(vs USD)_"
+            f"{a['direction']} `{a['target']}` _(vs {BASE_CURRENCY})_"
         )
         i += 1
     for a in pairs:
@@ -677,17 +708,12 @@ async def myalerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancelalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Cancel any alert by its number from /myalerts.
-    Usage: /cancelalert 1
-    """
+    """Usage: /cancelalert 1"""
     chat_id = update.effective_chat.id
     try:
-        index  = int(ctx.args[0]) - 1
-        single = price_alerts.get(chat_id, [])
-        pairs  = pair_alerts.get(chat_id, [])
-
-        # Combined list mirrors /myalerts order
+        index    = int(ctx.args[0]) - 1
+        single   = price_alerts.get(chat_id, [])
+        pairs    = pair_alerts.get(chat_id, [])
         combined = [("single", a) for a in single] + [("pair", a) for a in pairs]
 
         if index < 0 or index >= len(combined):
@@ -752,7 +778,7 @@ def main():
     t = threading.Thread(target=run_scheduler, args=(app,), daemon=True)
     t.start()
 
-    print("✅ Bot is running...")
+    print("✅ Bot is running with real-time Twelve Data rates...")
     app.run_polling()
 
 
