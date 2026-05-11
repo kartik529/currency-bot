@@ -12,7 +12,7 @@ TWELVE_API_KEY   = os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_DATA_API_KEY_HE
 BASE_CURRENCY    = "AUD"
 WATCH_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "INR"]  # default currencies
 ALERT_THRESHOLD  = 0.5   # % change to trigger fluctuation alert
-CHECK_INTERVAL   = 60    # seconds between checks
+CHECK_INTERVAL   = 900    # seconds between checks
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 previous_rates:   dict = {}
